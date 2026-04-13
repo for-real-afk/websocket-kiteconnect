@@ -1,0 +1,26 @@
+# Kite Simulator — Python dependencies
+# pip install -r requirements.txt
+
+# WebSocket server (simulator)
+websockets>=12.0
+
+# WebSocket client (ticker_sim.py)
+websocket-client>=1.8.0
+
+# Management REST API
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Shared utilities
+pytz>=2024.1
+apscheduler>=3.10.4
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Database (used by ticker_sim.py → database.py)
+pymysql>=1.1.0
+dbutils>=3.0.3
+pandas>=2.0.0
+
+# Pipeline (run_pipeline.py)
+pyyaml>=6.0

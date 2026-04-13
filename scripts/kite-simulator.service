@@ -1,0 +1,25 @@
+[Unit]
+Description=Zerodha Kite Ticker Simulator (WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kite-simulator
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/home/ubuntu/kite-simulator/venv/bin/python simulator/kite_simulator.py \
+          --host 0.0.0.0 \
+          --port 8765 \
+          --interval 1.0 \
+          --log-level INFO
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kite-simulator
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+[Unit]
+Description=Kite Simulator Management API (FastAPI)
+After=network-online.target kite-simulator.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/kite-simulator
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/kite-simulator/.env
+
+ExecStart=/home/ubuntu/kite-simulator/venv/bin/uvicorn management_api:app \
+          --host 0.0.0.0 \
+          --port 8766
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kite-mgmt-api
+
+[Install]
+WantedBy=multi-user.target
