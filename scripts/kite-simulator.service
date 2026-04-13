@@ -6,10 +6,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/kite-simulator
+WorkingDirectory=/home/ubuntu/kite-simulator/simulator
 Environment=PYTHONUNBUFFERED=1
 
-ExecStart=/home/ubuntu/kite-simulator/venv/bin/python simulator/kite_simulator.py \
+# Remove --force-open on production (respects real IST market hours)
+# Add --force-open for 24/7 tick testing
+ExecStart=/home/ubuntu/kite-simulator/venv/bin/python kite_simulator.py \
           --host 0.0.0.0 \
           --port 8765 \
           --interval 1.0 \

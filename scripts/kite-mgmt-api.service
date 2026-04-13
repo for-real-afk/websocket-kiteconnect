@@ -1,11 +1,13 @@
 [Unit]
 Description=Kite Simulator Management API (FastAPI)
-After=network-online.target kite-simulator.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=ubuntu
+
+# Run from project root so management_api.py can find simulator/ correctly
 WorkingDirectory=/home/ubuntu/kite-simulator
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/home/ubuntu/kite-simulator/.env

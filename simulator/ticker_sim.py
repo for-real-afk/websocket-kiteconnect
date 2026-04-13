@@ -242,11 +242,13 @@ class SimTickerManager:
             ws.send(json.dumps({"a": "mode", "v": ["quote", tokens]}))
 
     def _on_message(self, ws, data) -> None:
-        # Instrument manifest (JSON text frame)
+        # JSON text frame (instruments manifest, market status)
         if isinstance(data, str):
             try:
-                msg = json.loads(data)
-                if msg.get("type") == "instruments":
+                msg  = json.loads(data)
+                kind = msg.get("type", "")
+
+                if kind == "instruments":
                     with self._map_lock:
                         for inst in msg["data"]:
                             self._token_map[inst["instrument_token"]] = {
@@ -254,10 +256,16 @@ class SimTickerManager:
                                 "exchange": inst["exchange"],
                             }
                     logger.info("Token map loaded: %d instruments.", len(self._token_map))
-                    # Now subscribe
                     tokens = list(self._token_map.keys())
                     ws.send(json.dumps({"a": "subscribe", "v": tokens}))
                     ws.send(json.dumps({"a": "mode",      "v": ["quote", tokens]}))
+
+                elif kind == "market_open":
+                    logger.info("Market OPEN — ticks resuming.")
+
+                elif kind == "market_closed":
+                    logger.info("Market CLOSED. Next open: %s", msg.get("next_open", "?"))
+
             except Exception as exc:
                 logger.warning("JSON error: %s", exc)
             return

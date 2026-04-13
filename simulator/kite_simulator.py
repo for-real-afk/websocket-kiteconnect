@@ -2,55 +2,60 @@
 kite_simulator.py — Zerodha KiteTicker WebSocket Simulator
 ===========================================================
 
-Mimics Zerodha's KiteTicker WebSocket binary protocol exactly so that
-existing KiteTicker clients (real or patched) can connect without a paid
-Kite Connect subscription.
+Behaves like the real Zerodha KiteTicker across the full trading day:
+
+  Market OPEN  (Mon–Fri 09:15–15:30 IST)
+    → Binary QUOTE-mode tick frames every ~1 second
+    → Prices follow a random walk with mean-reversion
+    → Volume, buy/sell qty update each tick
+
+  Market CLOSED (all other times + weekends)
+    → WebSocket connection stays alive (no disconnect)
+    → Heartbeat b'\\x00' every 3 seconds keeps the TCP link up
+    → JSON status frame every 30 seconds so clients know why ticks stopped:
+        {"type": "market_closed", "next_open": "2026-04-14T09:15:00+05:30"}
+
+  Market OPEN transition (exactly 09:15 IST weekdays)
+    → Broadcasts {"type": "market_open"} to all connected clients
+    → Resets OHLC state (open = last_price, high/low = open, volume = 0)
+    → Binary ticks resume immediately
+
+  Market CLOSE transition (exactly 15:30 IST weekdays)
+    → Broadcasts {"type": "market_closed", "next_open": "..."}
+    → Binary ticks stop; heartbeat-only mode resumes
 
 Authentication
 --------------
-Clients must supply credentials in the WebSocket URL — identical to how
-real Kite Connect works:
+Clients connect with credentials in the URL query string:
 
-    ws://HOST:8765?api_key=sim_abc123&access_token=sat_xyz789
+    ws://HOST:8765?api_key=sim_abc&access_token=sat_xyz
 
-The server validates both values against config/api_keys.json.
-Connections with missing or invalid credentials are rejected immediately
-with WebSocket close code 4001.
+Invalid / missing credentials → WebSocket close code 4001.
 
-Binary frame format — QUOTE mode (184 bytes per instrument)
-------------------------------------------------------------
-  Bytes   Type     Field
-  0-1     uint16   number of packets in this frame
-  Then for each packet:
-    0-1   uint16   packet length (always 184)
-    ---- 184-byte packet body ----
-    0-3   int32    instrument_token
-    4-7   int32    last_traded_quantity
-    8-11  int32    average_traded_price  (× 100, paise)
-    12-15 int32    last_price            (× 100, paise)
-    16-19 int32    close_price           (× 100, paise)
-    20-23 int32    change                (× 100)
-    24-31 int64    volume_traded
-    32-35 int32    buy_quantity
-    36-39 int32    sell_quantity
-    40-43 int32    ohlc.open             (× 100, paise)
-    44-47 int32    ohlc.high             (× 100, paise)
-    48-51 int32    ohlc.low              (× 100, paise)
-    52-55 int32    ohlc.close            (× 100, paise)
-    56-183         (market depth — zeroed in QUOTE mode)
-
-Heartbeat: b'\\x00' (1 byte) every ~3 seconds.
-
-Subscription messages (JSON from client → server)
---------------------------------------------------
-    {"a": "subscribe",   "v": [738561, 341249]}
-    {"a": "unsubscribe", "v": [738561]}
-    {"a": "mode",        "v": ["quote", [738561]]}
+Binary frame format (QUOTE mode — 184 bytes / instrument)
+----------------------------------------------------------
+  Header  : uint16  num_packets
+  Per pkt : uint16  pkt_length (always 184)
+  Bytes 0-3  : int32  instrument_token
+  Bytes 4-7  : int32  last_traded_quantity
+  Bytes 8-11 : int32  average_traded_price  (x100 paise)
+  Bytes 12-15: int32  last_price            (x100 paise)
+  Bytes 16-19: int32  close_price           (x100 paise)
+  Bytes 20-23: int32  change                (x100)
+  Bytes 24-31: int64  volume_traded
+  Bytes 32-35: int32  buy_quantity
+  Bytes 36-39: int32  sell_quantity
+  Bytes 40-43: int32  ohlc.open             (x100 paise)
+  Bytes 44-47: int32  ohlc.high             (x100 paise)
+  Bytes 48-51: int32  ohlc.low              (x100 paise)
+  Bytes 52-55: int32  ohlc.close            (x100 paise)
+  Bytes 56-183: zeroed (market depth placeholder)
 
 Run
 ---
     python kite_simulator.py
     python kite_simulator.py --port 8765 --interval 1.0
+    python kite_simulator.py --force-open          # always send ticks (ignore real time)
 """
 
 from __future__ import annotations
@@ -61,9 +66,8 @@ import json
 import logging
 import random
 import struct
-import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Set
 from urllib.parse import parse_qs, urlparse
 
@@ -73,11 +77,44 @@ import websockets
 import auth as auth_store
 
 logger = logging.getLogger(__name__)
-IST    = pytz.timezone("Asia/Kolkata")
+IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------------------------
-# Instrument universe (add more rows to expand)
-# Real tokens from: https://api.kite.trade/instruments
+# Market hours
+# ---------------------------------------------------------------------------
+
+MARKET_OPEN_H,  MARKET_OPEN_M  = 9,  15
+MARKET_CLOSE_H, MARKET_CLOSE_M = 15, 30
+
+
+def _market_is_open(force_open: bool = False) -> bool:
+    if force_open:
+        return True
+    now = datetime.now(IST)
+    if now.weekday() >= 5:
+        return False
+    open_time  = now.replace(hour=MARKET_OPEN_H,  minute=MARKET_OPEN_M,  second=0, microsecond=0)
+    close_time = now.replace(hour=MARKET_CLOSE_H, minute=MARKET_CLOSE_M, second=0, microsecond=0)
+    return open_time <= now < close_time
+
+
+def _next_open_dt() -> datetime:
+    now  = datetime.now(IST)
+    base = now.replace(hour=MARKET_OPEN_H, minute=MARKET_OPEN_M, second=0, microsecond=0)
+    if now < base and now.weekday() < 5:
+        return base
+    candidate = base + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _next_open_iso() -> str:
+    return _next_open_dt().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Instrument universe
 # ---------------------------------------------------------------------------
 
 INSTRUMENTS: list[dict] = [
@@ -86,14 +123,13 @@ INSTRUMENTS: list[dict] = [
     {"token": 408065,  "symbol": "INFY",       "exchange": "NSE", "price": 1450.0},
     {"token": 2953217, "symbol": "TCS",        "exchange": "NSE", "price": 3350.0},
     {"token": 1270529, "symbol": "ICICIBANK",  "exchange": "NSE", "price": 1050.0},
-    {"token": 969473,  "symbol": "SBIN",       "exchange": "NSE", "price": 800.0},
-    {"token": 315393,  "symbol": "WIPRO",      "exchange": "NSE", "price": 460.0},
-    {"token": 1195009, "symbol": "TATAMOTORS", "exchange": "NSE", "price": 920.0},
+    {"token": 969473,  "symbol": "SBIN",       "exchange": "NSE", "price":  800.0},
+    {"token": 315393,  "symbol": "WIPRO",      "exchange": "NSE", "price":  460.0},
+    {"token": 1195009, "symbol": "TATAMOTORS", "exchange": "NSE", "price":  920.0},
     {"token": 134657,  "symbol": "AXISBANK",   "exchange": "NSE", "price": 1100.0},
     {"token": 779521,  "symbol": "SUNPHARMA",  "exchange": "NSE", "price": 1600.0},
 ]
 
-# Mutable per-instrument price state, keyed by instrument_token
 _state: Dict[int, dict] = {}
 
 
@@ -113,22 +149,28 @@ def _init_state() -> None:
         }
 
 
+def _reset_daily_ohlc() -> None:
+    for s in _state.values():
+        p = s["last_price"]
+        s.update(open=p, high=p, low=p, volume=0)
+    logger.info("Daily OHLC state reset for market open.")
+
+
 # ---------------------------------------------------------------------------
-# Price simulation — random walk with mean-reversion
+# Price simulation
 # ---------------------------------------------------------------------------
 
 def _tick_price(s: dict) -> dict:
-    drift     = (s["open"] - s["last_price"]) / s["open"] * 0.005
+    drift     = (s["open"] - s["last_price"]) / max(s["open"], 0.01) * 0.005
     shock     = random.gauss(drift, 0.002)
     new_price = round(max(s["last_price"] * (1 + shock), 0.05), 2)
-
     s["last_price"] = new_price
     s["high"]       = max(s["high"], new_price)
     s["low"]        = min(s["low"],  new_price)
     s["volume"]    += random.randint(100, 5_000)
     s["buy_qty"]    = random.randint(500, 80_000)
     s["sell_qty"]   = random.randint(500, 80_000)
-    s["change"]     = round((new_price - s["close"]) / s["close"] * 100, 2)
+    s["change"]     = round((new_price - s["close"]) / max(s["close"], 0.01) * 100, 2)
     return s
 
 
@@ -137,37 +179,29 @@ def _tick_price(s: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _pack_one(s: dict) -> bytes:
-    """Pack one instrument state into a 184-byte QUOTE packet."""
-    p = lambda v: int(round(v * 100))          # price → paise integer
-
+    p    = lambda v: int(round(v * 100))
     body = struct.pack(
         ">iiiiiiqiiiiii",
         s["token"],
-        1,                                      # last_traded_quantity (dummy)
-        p(s["last_price"]),                     # average_traded_price
-        p(s["last_price"]),                     # last_price
-        p(s["close"]),                          # close_price (prev day)
-        int(s["change"] * 100),                 # change × 100
-        s["volume"],                            # volume_traded (int64)
+        1,
+        p(s["last_price"]),
+        p(s["last_price"]),
+        p(s["close"]),
+        int(s["change"] * 100),
+        s["volume"],
         s["buy_qty"],
         s["sell_qty"],
         p(s["open"]), p(s["high"]),
-        p(s["low"]),  p(s["close"]),            # ohlc
+        p(s["low"]),  p(s["close"]),
     )
-    # body = 60 bytes; pad to 184 (market depth section zeroed)
     body += b"\x00" * (184 - len(body))
-    return body   # 184 bytes
+    return body
 
 
-def _build_message(tokens: list[int]) -> bytes:
-    """
-    Build a single WebSocket binary message for N instruments.
-    Layout:  [uint16 num_packets]  [uint16 pkt_len][pkt_body] × N
-    """
+def _build_tick_message(tokens: list[int]) -> bytes:
     packets = [_pack_one(_tick_price(_state[t])) for t in tokens if t in _state]
     if not packets:
         return b""
-
     msg = struct.pack(">H", len(packets))
     for pkt in packets:
         msg += struct.pack(">H", len(pkt)) + pkt
@@ -178,37 +212,69 @@ def _build_message(tokens: list[int]) -> bytes:
 # Connection registry
 # ---------------------------------------------------------------------------
 
-# ws → set of subscribed tokens
 _connections: Dict[Any, Set[int]] = {}
-
-# ws → api_key (for logging)
-_conn_keys: Dict[Any, str] = {}
+_conn_keys:   Dict[Any, str]      = {}
 
 
 # ---------------------------------------------------------------------------
-# Auth helper — parse query-string from WS path
+# Broadcast helpers
+# ---------------------------------------------------------------------------
+
+async def _broadcast_json(payload: dict) -> None:
+    msg  = json.dumps(payload)
+    dead = []
+    for ws in list(_connections):
+        try:
+            await ws.send(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connections.pop(ws, None)
+        _conn_keys.pop(ws, None)
+
+
+async def _broadcast_ticks() -> None:
+    dead = []
+    for ws, tokens in list(_connections.items()):
+        if not tokens:
+            continue
+        try:
+            msg = _build_tick_message(list(tokens))
+            if msg:
+                await ws.send(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connections.pop(ws, None)
+        _conn_keys.pop(ws, None)
+
+
+async def _broadcast_heartbeat() -> None:
+    dead = []
+    for ws in list(_connections):
+        try:
+            await ws.send(b"\x00")
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connections.pop(ws, None)
+        _conn_keys.pop(ws, None)
+
+
+# ---------------------------------------------------------------------------
+# Auth
 # ---------------------------------------------------------------------------
 
 def _authenticate(ws: Any) -> tuple[bool, str]:
-    """
-    Extract api_key and access_token from the WebSocket request URL and
-    validate them.  Returns (ok: bool, api_key: str).
-    """
     try:
-        # websockets v12+: ws.request.path
-        # websockets v10/11: ws.path
         raw_path = getattr(ws.request, "path", None) or getattr(ws, "path", "/")
     except AttributeError:
         raw_path = "/"
-
-    qs = parse_qs(urlparse(raw_path).query)
-
+    qs           = parse_qs(urlparse(raw_path).query)
     api_key      = qs.get("api_key",      [""])[0]
     access_token = qs.get("access_token", [""])[0]
-
     if not api_key or not access_token:
         return False, ""
-
     return auth_store.validate(api_key, access_token), api_key
 
 
@@ -216,118 +282,117 @@ def _authenticate(ws: Any) -> tuple[bool, str]:
 # WebSocket handler
 # ---------------------------------------------------------------------------
 
-async def _handle(ws: Any) -> None:
+async def _handle(ws: Any, force_open: bool = False) -> None:
     ok, api_key = _authenticate(ws)
-
     if not ok:
-        logger.warning("Rejected unauthenticated connection from %s", ws.remote_address)
+        logger.warning("Rejected connection from %s — bad credentials", ws.remote_address)
         await ws.close(code=4001, reason="Invalid or missing api_key / access_token")
         return
 
-    # Subscribe to all instruments by default
-    _connections[ws]  = set(_state.keys())
-    _conn_keys[ws]    = api_key
-    client            = ws.remote_address
+    _connections[ws] = set(_state.keys())
+    _conn_keys[ws]   = api_key
+    logger.info("Client connected: %s  (total=%d)", ws.remote_address, len(_connections))
 
-    logger.info("Client connected: %s  api_key=%s  (total=%d)",
-                client, api_key, len(_connections))
-
-    # Send instrument manifest so client can build token→symbol map
+    # Instrument manifest
     await ws.send(json.dumps({
         "type": "instruments",
         "data": [
-            {
-                "instrument_token": inst["token"],
-                "tradingsymbol":    inst["symbol"],
-                "exchange":         inst["exchange"],
-            }
+            {"instrument_token": inst["token"],
+             "tradingsymbol":    inst["symbol"],
+             "exchange":         inst["exchange"]}
             for inst in INSTRUMENTS
         ],
     }))
 
+    # Immediate market status so client knows what to expect
+    if _market_is_open(force_open):
+        await ws.send(json.dumps({"type": "market_open"}))
+    else:
+        await ws.send(json.dumps({
+            "type":      "market_closed",
+            "next_open": _next_open_iso(),
+            "message":   "Market is closed. Ticks will resume at next open.",
+        }))
+
     try:
         async for raw in ws:
             if isinstance(raw, bytes):
-                continue   # ignore binary from client
+                continue
             try:
                 msg    = json.loads(raw)
                 action = msg.get("a", "")
                 values = msg.get("v", [])
-
                 if action == "subscribe":
-                    tokens = [int(t) for t in values if int(t) in _state]
-                    _connections[ws].update(tokens)
-
+                    _connections[ws].update(int(t) for t in values if int(t) in _state)
                 elif action == "unsubscribe":
-                    _connections[ws].difference_update([int(t) for t in values])
-
+                    _connections[ws].difference_update(int(t) for t in values)
                 elif action == "mode":
-                    # ["quote", [token1, token2]]
                     extra = [int(t) for t in (values[1] if len(values) > 1 else [])
                              if int(t) in _state]
                     _connections[ws].update(extra)
-
             except (json.JSONDecodeError, ValueError):
-                logger.debug("Bad message from %s: %r", client, raw[:80])
+                pass
 
     except websockets.exceptions.ConnectionClosed as exc:
-        logger.info("Disconnected: %s  code=%s", client, exc.code)
+        logger.info("Disconnected: %s  code=%s", ws.remote_address, exc.code)
     finally:
         _connections.pop(ws, None)
-        _conn_keys.pop(ws,   None)
-        logger.info("Client removed: %s  (total=%d)", client, len(_connections))
+        _conn_keys.pop(ws, None)
+        logger.info("Client removed (total=%d)", len(_connections))
 
 
 # ---------------------------------------------------------------------------
-# Broadcast loop
+# Main broadcast loop
 # ---------------------------------------------------------------------------
 
-async def _broadcast_loop(interval: float) -> None:
-    HB_INTERVAL = 3.0
+async def _main_loop(interval: float, force_open: bool) -> None:
+    HB_INTERVAL     = 3.0
+    STATUS_INTERVAL = 30.0
+
     last_hb     = time.monotonic()
+    last_status = time.monotonic()
+    prev_open   = _market_is_open(force_open)
+
+    logger.info("Market is %s.", "OPEN" if prev_open else "CLOSED")
 
     while True:
         await asyncio.sleep(interval)
+        now     = time.monotonic()
+        is_open = _market_is_open(force_open)
 
-        now    = time.monotonic()
-        send_hb = (now - last_hb) >= HB_INTERVAL
-        dead   = []
+        # Transition: closed → open
+        if is_open and not prev_open:
+            _reset_daily_ohlc()
+            await _broadcast_json({"type": "market_open"})
+            logger.info("Market OPENED — ticks resuming (%d client(s)).", len(_connections))
 
-        for ws, tokens in list(_connections.items()):
-            if not tokens:
-                continue
-            try:
-                await ws.send(_build_message(list(tokens)))
-                if send_hb:
-                    await ws.send(b"\x00")      # heartbeat
-            except Exception:
-                dead.append(ws)
+        # Transition: open → closed
+        elif not is_open and prev_open:
+            await _broadcast_json({
+                "type":      "market_closed",
+                "next_open": _next_open_iso(),
+                "message":   "Market has closed for the day.",
+            })
+            logger.info("Market CLOSED — heartbeat mode.")
 
-        for ws in dead:
-            _connections.pop(ws, None)
-            _conn_keys.pop(ws, None)
+        prev_open = is_open
 
-        if send_hb:
+        if is_open:
+            await _broadcast_ticks()
+        else:
+            # Periodic status frames
+            if (now - last_status) >= STATUS_INTERVAL:
+                await _broadcast_json({
+                    "type":      "market_closed",
+                    "next_open": _next_open_iso(),
+                    "clients":   len(_connections),
+                })
+                last_status = now
+
+        # Heartbeat in both modes
+        if (now - last_hb) >= HB_INTERVAL:
+            await _broadcast_heartbeat()
             last_hb = now
-
-
-# ---------------------------------------------------------------------------
-# Daily OHLC reset at 09:15 IST
-# ---------------------------------------------------------------------------
-
-async def _daily_reset_loop() -> None:
-    from datetime import timedelta
-    while True:
-        now  = datetime.now(IST)
-        nxt  = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        if now >= nxt:
-            nxt += timedelta(days=1)
-        await asyncio.sleep((nxt - now).total_seconds())
-        if datetime.now(IST).weekday() < 5:
-            for s in _state.values():
-                s.update(open=s["last_price"], high=s["last_price"],
-                         low=s["last_price"],  volume=0)
-            logger.info("Daily OHLC state reset at market open.")
 
 
 # ---------------------------------------------------------------------------
@@ -336,41 +401,40 @@ async def _daily_reset_loop() -> None:
 
 def _args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Zerodha KiteTicker WebSocket Simulator")
-    p.add_argument("--host",      default="0.0.0.0")
-    p.add_argument("--port",      default=8765,  type=int)
-    p.add_argument("--interval",  default=1.0,   type=float, help="Tick interval (seconds)")
-    p.add_argument("--log-level", default="INFO",
+    p.add_argument("--host",       default="0.0.0.0")
+    p.add_argument("--port",       default=8765,  type=int)
+    p.add_argument("--interval",   default=1.0,   type=float)
+    p.add_argument("--force-open", action="store_true",
+                   help="Always send ticks regardless of IST time (good for local testing)")
+    p.add_argument("--log-level",  default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p.parse_args()
 
 
-async def _main(host: str, port: int, interval: float) -> None:
+async def _main(host: str, port: int, interval: float, force_open: bool) -> None:
     _init_state()
 
-    # Create a default key if no keys exist yet
     default = auth_store.ensure_default_key()
     if default:
-        print("\n" + "═" * 60)
+        print("\n" + "=" * 60)
         print("  FIRST-RUN DEFAULT CREDENTIALS (save these now!)")
         print(f"  api_key      = {default['api_key']}")
         print(f"  access_token = {default['access_tokens'][0]}")
-        print("═" * 60 + "\n")
+        print("=" * 60 + "\n")
 
-    logger.info(
-        "Kite Simulator ready — ws://%s:%d  instruments=%d  tick=%.1fs",
-        host, port, len(_state), interval,
-    )
+    status = "OPEN (forced)" if force_open else ("OPEN" if _market_is_open() else "CLOSED")
+    logger.info("Kite Simulator ready — ws://%s:%d  instruments=%d  market=%s",
+                host, port, len(_state), status)
 
-    async with websockets.serve(
-        _handle, host, port,
-        ping_interval=20,
-        ping_timeout=30,
-        max_size=None,
-    ):
-        await asyncio.gather(
-            _broadcast_loop(interval),
-            _daily_reset_loop(),
-        )
+    if not force_open and not _market_is_open():
+        logger.info("Next market open: %s  (use --force-open to test anytime)", _next_open_iso())
+
+    async def handler(ws: Any) -> None:
+        await _handle(ws, force_open=force_open)
+
+    async with websockets.serve(handler, host, port,
+                                ping_interval=20, ping_timeout=30, max_size=None):
+        await _main_loop(interval, force_open)
 
 
 def main() -> None:
@@ -380,11 +444,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # Windows: use asyncio.run() + KeyboardInterrupt catch.
-    # Linux/Mac: same approach works fine too — simpler than add_signal_handler.
     try:
-        asyncio.run(_main(args.host, args.port, args.interval))
+        asyncio.run(_main(args.host, args.port, args.interval, args.force_open))
     except KeyboardInterrupt:
         pass
     finally:
