@@ -227,7 +227,7 @@ def _build_frame(tokens: list[int] | None = None) -> bytes:
 # Auth
 # ---------------------------------------------------------------------------
 
-sys.path.insert(0, str(_ROOT / "simulator"))
+sys.path.insert(0, str(_ROOT))
 try:
     import auth as auth_store
     AUTH_AVAILABLE = True
@@ -236,7 +236,8 @@ except ImportError:
     logger.warning("auth.py not found — ALL connections accepted (dev mode).")
 
 
-def _authenticate(path: str) -> bool:
+def _authenticate(ws) -> bool:
+    path = ws.request.path
     qs = parse_qs(urlparse(path).query)
     api_key = qs.get("api_key",      [""])[0]
     token   = qs.get("access_token", [""])[0]
@@ -266,7 +267,7 @@ _INSTRUMENTS_MSG = json.dumps({
 
 async def handler(ws: websockets.WebSocketServerProtocol) -> None:
     # 1. Auth
-    if not _authenticate(ws.path):
+    if not _authenticate(ws):
         logger.warning("Auth failed from %s", ws.remote_address)
         await ws.close(4001, "Invalid api_key or access_token")
         return
