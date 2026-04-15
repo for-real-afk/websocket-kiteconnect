@@ -333,7 +333,6 @@ async def _broadcast_ticks(tick_fn) -> None:
 # Auth
 # ---------------------------------------------------------------------------
 
-<<<<<<< HEAD
 sys.path.insert(0, str(_ROOT))
 try:
     import auth as auth_store
@@ -353,19 +352,6 @@ def _authenticate(ws) -> bool:
     if not AUTH_AVAILABLE:
         return True    # dev mode: accept anything
     return auth_store.validate(api_key, token)
-=======
-def _authenticate(ws: Any) -> tuple[bool, str]:
-    try:
-        raw_path = getattr(ws.request, "path", None) or getattr(ws, "path", "/")
-    except AttributeError:
-        raw_path = "/"
-    qs           = parse_qs(urlparse(raw_path).query)
-    api_key      = qs.get("api_key",      [""])[0]
-    access_token = qs.get("access_token", [""])[0]
-    if not api_key or not access_token:
-        return False, ""
-    return auth_store.validate(api_key, access_token), api_key
->>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f
 
 
 # ---------------------------------------------------------------------------
@@ -381,23 +367,11 @@ _MANIFEST = json.dumps({
 })
 
 
-<<<<<<< HEAD
 async def handler(ws: websockets.WebSocketServerProtocol) -> None:
     # 1. Auth
     if not _authenticate(ws):
         logger.warning("Auth failed from %s", ws.remote_address)
         await ws.close(4001, "Invalid api_key or access_token")
-=======
-# ---------------------------------------------------------------------------
-# WebSocket connection handler
-# ---------------------------------------------------------------------------
-
-async def _handle(ws: Any, force_open: bool = False) -> None:
-    ok, api_key = _authenticate(ws)
-    if not ok:
-        logger.warning("Rejected %s — bad credentials", ws.remote_address)
-        await ws.close(code=4001, reason="Invalid api_key or access_token")
->>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f
         return
 
     all_tokens = list(_state.keys())
@@ -628,14 +602,4 @@ def main() -> None:
     try:
         asyncio.run(_main(args.host, args.port, args.force_open))
     except KeyboardInterrupt:
-<<<<<<< HEAD
         logger.info("Simulator stopped.")
-=======
-        pass
-    finally:
-        logger.info("Simulator stopped.")
-
-
-if __name__ == "__main__":
-    main()
->>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f
