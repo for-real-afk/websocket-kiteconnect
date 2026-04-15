@@ -1,34 +1,28 @@
 """
-kite_simulator.py — WebSocket server mimicking Zerodha KiteTicker binary protocol
-==================================================================================
+kite_simulator.py — Zerodha KiteTicker WebSocket Simulator (3-Phase)
+=====================================================================
 
-Behaviour matches real Zerodha KiteConnect exactly:
+Three phases, exactly like real Zerodha:
 
-  ┌─────────────────────┬────────────────────────────────────────────────────┐
-  │ Scenario            │ What is sent                                       │
-  ├─────────────────────┼────────────────────────────────────────────────────┤
-  │ Market OPEN         │ Binary QUOTE-mode tick frames every 1 second       │
-  │ Market CLOSED       │ 0x21 heartbeat byte every 10 seconds               │
-  │ New conn (closed)   │ One cached-price binary packet → then heartbeats   │
-  │ Invalid credentials │ Close code 4001                                    │
-  └─────────────────────┴────────────────────────────────────────────────────┘
+  Phase 1  OPEN        09:15–15:30 IST Mon–Fri (non-holiday)
+           Binary QUOTE-mode tick frames every 1 second.
+
+  Phase 2  POST-MARKET 15:30–16:00 IST Mon–Fri (non-holiday)
+           Sparse binary packets every 15-30 seconds.
+           Prices converge toward the official closing price.
+
+  Phase 3  CLOSED      16:00 onward, ALL weekends, ALL NSE holidays
+           0x21 heartbeat byte every 10 seconds. No price data.
+
+  NEW CONNECTION while closed / post-market:
+           One cached binary snapshot sent immediately (last known prices),
+           then normal phase behaviour.
 
 Run
 ---
-    # Normal mode (respects IST market hours)
-    python kite_simulator.py
-
-    # Force market always OPEN (for 24/7 testing)
-    python kite_simulator.py --force-open
-
-    # Custom port / host
-    python kite_simulator.py --host 0.0.0.0 --port 8765
-
-Environment (.env)
-------------------
-    ADMIN_TOKEN=change_me_secret       # bearer token for /admin/* REST calls
-    SIM_HOST=0.0.0.0
-    SIM_PORT=8765
+    python kite_simulator.py                  # respects real IST market hours
+    python kite_simulator.py --force-open     # always Phase 1 (for 24/7 testing)
+    python kite_simulator.py --log-level DEBUG
 """
 
 from __future__ import annotations
@@ -37,196 +31,309 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import random
 import struct
-import sys
-from datetime import datetime, time as dtime
-from pathlib import Path
+import time
+from datetime import date, datetime, timedelta, timezone, time as dt
+from typing import Any, Dict, Set
 from urllib.parse import parse_qs, urlparse
 
 import pytz
 import websockets
-from dotenv import load_dotenv
+
+import auth as auth_store
+
+logger = logging.getLogger(__name__)
+IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------------------------
-# Bootstrap
+# NSE Holiday Calendar  (add future years as needed)
+# Source: NSE India official holiday list
 # ---------------------------------------------------------------------------
 
-_ROOT = Path(__file__).resolve().parent
-load_dotenv(_ROOT / ".env")
+NSE_HOLIDAYS: set[date] = {
+    # 2025
+    date(2025, 1, 26),   # Republic Day
+    date(2025, 2, 26),   # Mahashivratri
+    date(2025, 3, 14),   # Holi
+    date(2025, 3, 31),   # Id-Ul-Fitr
+    date(2025, 4, 10),   # Shri Ram Navami
+    date(2025, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2025, 4, 18),   # Good Friday
+    date(2025, 5, 1),    # Maharashtra Day
+    date(2025, 8, 15),   # Independence Day
+    date(2025, 8, 27),   # Ganesh Chaturthi
+    date(2025, 10, 2),   # Gandhi Jayanti / Dussehra
+    date(2025, 10, 20),  # Diwali Laxmi Pujan
+    date(2025, 10, 21),  # Diwali Balipratipada
+    date(2025, 11, 5),   # Prakash Gurpurb Sri Guru Nanak Dev Ji
+    date(2025, 12, 25),  # Christmas
 
-logger = logging.getLogger("kite_simulator")
-IST    = pytz.timezone("Asia/Kolkata")
-
-MARKET_OPEN  = dtime(9,  15, 0)
-MARKET_CLOSE = dtime(15, 30, 0)
-
-HEARTBEAT_BYTE    = bytes([0x21])          # Zerodha heartbeat
-TICK_INTERVAL     = 1.0                    # seconds between tick frames
-HEARTBEAT_INTERVAL = 10.0                  # seconds between heartbeats (closed)
+    # 2026
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 25),   # Holi
+    date(2026, 4, 2),    # Shri Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 10),   # Mahavir Jayanti
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 8, 15),   # Independence Day
+    date(2026, 10, 2),   # Gandhi Jayanti
+    date(2026, 10, 21),  # Diwali Laxmi Pujan
+    date(2026, 10, 22),  # Diwali Balipratipada
+    date(2026, 11, 5),   # Guru Nanak Jayanti
+    date(2026, 12, 25),  # Christmas
+}
 
 # ---------------------------------------------------------------------------
-# Instruments — edit freely; real tokens from api.kite.trade/instruments
+# Phase timing constants
 # ---------------------------------------------------------------------------
 
-INSTRUMENTS: list[dict] = [
-    {"token": 738561,  "symbol": "RELIANCE",   "exchange": "NSE", "base": 2950.0},
-    {"token": 341249,  "symbol": "HDFCBANK",   "exchange": "NSE", "base": 1680.0},
-    {"token": 408065,  "symbol": "INFY",       "exchange": "NSE", "base": 1450.0},
-    {"token": 2953217, "symbol": "TCS",        "exchange": "NSE", "base": 3350.0},
-    {"token": 1270529, "symbol": "ICICIBANK",  "exchange": "NSE", "base": 1050.0},
-    {"token": 969473,  "symbol": "SBIN",       "exchange": "NSE", "base":  800.0},
-    {"token": 315393,  "symbol": "WIPRO",      "exchange": "NSE", "base":  460.0},
-    {"token": 1195009, "symbol": "TATAMOTORS", "exchange": "NSE", "base":  920.0},
-    {"token": 134657,  "symbol": "AXISBANK",   "exchange": "NSE", "base": 1100.0},
-    {"token": 779521,  "symbol": "SUNPHARMA",  "exchange": "NSE", "base": 1600.0},
-]
+MARKET_OPEN_TIME     = dt(9,  15, 0)
+MARKET_CLOSE_TIME    = dt(15, 30, 0)
+POST_MARKET_END_TIME = dt(16,  0, 0)
+
+LIVE_TICK_INTERVAL   = 1.0    # seconds between live ticks (Phase 1)
+POST_MARKET_MIN      = 15.0   # min seconds between post-market ticks (Phase 2)
+POST_MARKET_MAX      = 30.0   # max seconds between post-market ticks (Phase 2)
+HEARTBEAT_INTERVAL   = 10.0   # seconds between 0x21 heartbeats (Phase 3)
+
+HEARTBEAT_BYTE = struct.pack("B", 33)   # 0x21
+
 
 # ---------------------------------------------------------------------------
-# Shared mutable state
+# Phase detection  — the single source of truth
 # ---------------------------------------------------------------------------
-
-# last_prices[token] = {last, open, high, low, close, volume, buy_qty, sell_qty}
-last_prices: dict[int, dict] = {}
-
-# connected clients
-connected_clients: set[websockets.WebSocketServerProtocol] = set()
-
-# market state flag (set by market_controller coroutine)
-market_open_flag = False
-
-# force-open flag set from CLI
-force_open = False
-
 
 def _now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def _is_market_open() -> bool:
-    if force_open:
-        return True
-    now = _now_ist()
-    if now.weekday() >= 5:           # Saturday / Sunday
+def _is_trading_day(d: date | None = None) -> bool:
+    """True if NSE is open on this date (not weekend, not holiday)."""
+    if d is None:
+        d = _now_ist().date()
+    if d.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
+    if d in NSE_HOLIDAYS:
+        return False
+    return True
+
+
+def _phase(force_open: bool = False) -> str:
+    """
+    Returns exactly one of:  'open' | 'post_market' | 'closed'
+
+    This is called every loop iteration — it is THE gate that decides
+    what data gets broadcast.  force_open bypasses the calendar check.
+    """
+    if force_open:
+        return "open"
+
+    now = _now_ist()
+
+    # Weekend or holiday → always closed, no ticks
+    if not _is_trading_day(now.date()):
+        return "closed"
+
     t = now.time()
-    return MARKET_OPEN <= t < MARKET_CLOSE
+
+    if MARKET_OPEN_TIME <= t < MARKET_CLOSE_TIME:
+        return "open"
+
+    if MARKET_CLOSE_TIME <= t < POST_MARKET_END_TIME:
+        return "post_market"
+
+    return "closed"
+
+
+def _next_open_iso() -> str:
+    """ISO timestamp of the next market open (skips weekends + holidays)."""
+    now       = _now_ist()
+    candidate = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    # If today's open is still in the future and today is a trading day, use it
+    if candidate > now and _is_trading_day(candidate.date()):
+        return candidate.isoformat()
+    # Otherwise advance day by day until we find a trading day
+    candidate += timedelta(days=1)
+    while not _is_trading_day(candidate.date()):
+        candidate += timedelta(days=1)
+    candidate = candidate.replace(hour=9, minute=15, second=0, microsecond=0)
+    return candidate.isoformat()
+
+
+def _is_holiday_or_weekend(d: date | None = None) -> bool:
+    return not _is_trading_day(d)
 
 
 # ---------------------------------------------------------------------------
-# Price simulation — random walk with intraday OHLC tracking
+# Instrument universe
 # ---------------------------------------------------------------------------
 
-def _init_prices() -> None:
-    """Initialise last_prices from INSTRUMENTS base prices."""
+INSTRUMENTS: list[dict] = [
+    {"token": 738561,  "symbol": "RELIANCE",   "exchange": "NSE", "price": 2950.0},
+    {"token": 341249,  "symbol": "HDFCBANK",   "exchange": "NSE", "price": 1680.0},
+    {"token": 408065,  "symbol": "INFY",       "exchange": "NSE", "price": 1450.0},
+    {"token": 2953217, "symbol": "TCS",        "exchange": "NSE", "price": 3350.0},
+    {"token": 1270529, "symbol": "ICICIBANK",  "exchange": "NSE", "price": 1050.0},
+    {"token": 969473,  "symbol": "SBIN",       "exchange": "NSE", "price":  800.0},
+    {"token": 315393,  "symbol": "WIPRO",      "exchange": "NSE", "price":  460.0},
+    {"token": 1195009, "symbol": "TATAMOTORS", "exchange": "NSE", "price":  920.0},
+    {"token": 134657,  "symbol": "AXISBANK",   "exchange": "NSE", "price": 1100.0},
+    {"token": 779521,  "symbol": "SUNPHARMA",  "exchange": "NSE", "price": 1600.0},
+]
+
+_state: Dict[int, dict] = {}
+
+
+def _init_state() -> None:
     for inst in INSTRUMENTS:
-        t = inst["token"]
-        p = inst["base"]
-        last_prices[t] = {
-            "last":     p,
-            "open":     p,
-            "high":     p,
-            "low":      p,
-            "close":    p,           # previous close
-            "volume":   random.randint(500_000, 2_000_000),
-            "buy_qty":  random.randint(1_000, 50_000),
-            "sell_qty": random.randint(1_000, 50_000),
-            "change":   0.0,
+        p = inst["price"]
+        _state[inst["token"]] = {
+            **inst,
+            "last_price":     p,
+            "open":           p,
+            "high":           p,
+            "low":            p,
+            "close":          round(p * random.uniform(0.98, 1.02), 2),
+            "official_close": None,
+            "volume":         0,
+            "buy_qty":        random.randint(1_000, 50_000),
+            "sell_qty":       random.randint(1_000, 50_000),
+            "change":         0.0,
         }
 
 
-def _tick_prices() -> None:
-    """Advance each instrument by a small random step."""
-    for inst in INSTRUMENTS:
-        t   = inst["token"]
-        rec = last_prices[t]
-
-        # ±0.05 % random walk, mean-reverting toward base
-        drift  = (inst["base"] - rec["last"]) * 0.0001
-        change = rec["last"] * random.uniform(-0.0005, 0.0005) + drift
-        new_lp = max(rec["last"] + change, 0.10)
-
-        rec["last"]     = new_lp
-        rec["high"]     = max(rec["high"], new_lp)
-        rec["low"]      = min(rec["low"],  new_lp)
-        rec["volume"]  += random.randint(100, 5000)
-        rec["buy_qty"]  = random.randint(1_000, 50_000)
-        rec["sell_qty"] = random.randint(1_000, 50_000)
-        rec["change"]   = ((new_lp - rec["close"]) / rec["close"]) * 100
+def _reset_daily_ohlc() -> None:
+    for s in _state.values():
+        p = s["last_price"]
+        s["open"] = s["high"] = s["low"] = p
+        s["volume"]         = 0
+        s["official_close"] = None
+    logger.info("Daily OHLC reset for market open.")
 
 
-def _reset_daily() -> None:
-    """Called at market open — reset OHLC to current price as new open."""
-    for inst in INSTRUMENTS:
-        t   = inst["token"]
-        rec = last_prices[t]
-        rec["open"]   = rec["last"]
-        rec["high"]   = rec["last"]
-        rec["low"]    = rec["last"]
-        rec["volume"] = 0
-        rec["change"] = 0.0
+def _set_official_close() -> None:
+    """Lock VWAP-simulated closing prices at 15:30."""
+    for s in _state.values():
+        s["official_close"] = round(s["last_price"] * random.uniform(0.9995, 1.0005), 2)
+    logger.info("Official closing prices locked in (15:30 IST).")
 
 
 # ---------------------------------------------------------------------------
-# Binary frame builder (Zerodha QUOTE-mode)
+# Price simulation
 # ---------------------------------------------------------------------------
 
-# struct layout: token, ltq, avg_price, last_price, close_price, change,
-#                volume (q), buy_qty, sell_qty, open, high, low, close
+def _tick_live(s: dict) -> None:
+    drift = (s["price"] - s["last_price"]) / max(s["price"], 0.01) * 0.001
+    shock = random.gauss(drift, 0.0015)
+    p     = round(max(s["last_price"] * (1 + shock), 0.05), 2)
+    s["last_price"] = p
+    s["high"]       = max(s["high"], p)
+    s["low"]        = min(s["low"],  p)
+    s["volume"]    += random.randint(100, 5_000)
+    s["buy_qty"]    = random.randint(500, 80_000)
+    s["sell_qty"]   = random.randint(500, 80_000)
+    s["change"]     = round((p - s["close"]) / max(s["close"], 0.01) * 100, 4)
+
+
+def _tick_post_market(s: dict) -> None:
+    """Gentle convergence toward official close, very sparse volume."""
+    target = s["official_close"] or s["last_price"]
+    pull   = (target - s["last_price"]) * random.uniform(0.05, 0.15)
+    noise  = s["last_price"] * random.gauss(0, 0.0002)
+    p      = round(max(s["last_price"] + pull + noise, 0.05), 2)
+    s["last_price"] = p
+    s["high"]       = max(s["high"], p)
+    s["low"]        = min(s["low"],  p)
+    s["volume"]    += random.randint(10, 200)      # tiny end-of-day lots
+    s["buy_qty"]    = random.randint(100, 5_000)
+    s["sell_qty"]   = random.randint(100, 5_000)
+    s["change"]     = round((p - s["close"]) / max(s["close"], 0.01) * 100, 4)
+
+
+# ---------------------------------------------------------------------------
+# Binary frame builder  (Zerodha QUOTE-mode, 184-byte packets)
+# ---------------------------------------------------------------------------
+
 _PKT_FMT = ">iiiiiiqiiiiii"
-_PKT_BODY = struct.calcsize(_PKT_FMT)        # 56 bytes
-_PKT_LEN  = _PKT_BODY + 4                    # pad to 60 so client check (< 60) passes
+_PKT_LEN  = 184   # padded to 184 bytes to match real Zerodha wire format
 
 
-def _pack_one(token: int, rec: dict) -> bytes:
-    """Pack one instrument into a 60-byte QUOTE packet."""
-    def p(x): return int(round(x * 100))     # float → paise
+def _pack_one(s: dict, tick_fn=None) -> bytes:
+    if tick_fn:
+        tick_fn(s)
+
+    def p(v): return int(round(v * 100))
 
     body = struct.pack(
         _PKT_FMT,
-        token,
-        p(rec["last"]),           # last traded qty (reused)
-        p(rec["last"]),           # avg price
-        p(rec["last"]),           # last price  ← the one clients use
-        p(rec["close"]),          # previous close
-        p(rec["change"]),         # % change × 100
-        rec["volume"],            # volume (int64)
-        rec["buy_qty"],
-        rec["sell_qty"],
-        p(rec["open"]),
-        p(rec["high"]),
-        p(rec["low"]),
-        p(rec["close"]),
+        s["token"],
+        1,
+        p(s["last_price"]),
+        p(s["last_price"]),
+        p(s["close"]),
+        int(s["change"] * 100),
+        s["volume"],
+        s["buy_qty"],
+        s["sell_qty"],
+        p(s["open"]), p(s["high"]),
+        p(s["low"]),  p(s["close"]),
     )
-    return body + b"\x00" * 4    # 4-byte padding → 60 bytes total
+    body += b"\x00" * (_PKT_LEN - len(body))
+    return body
 
 
-def _build_frame(tokens: list[int] | None = None) -> bytes:
-    """
-    Build a complete Zerodha binary frame for the requested tokens
-    (or all instruments if tokens is None).
-    """
-    if tokens is None:
-        tokens = [i["token"] for i in INSTRUMENTS]
-
+def _build_frame(tokens: list[int], tick_fn=None) -> bytes:
     packets = []
     for token in tokens:
-        rec = last_prices.get(token)
-        if rec is None:
-            continue
-        pkt = _pack_one(token, rec)
-        # each packet is prefixed with its uint16 length
-        packets.append(struct.pack(">H", len(pkt)) + pkt)
+        s = _state.get(token)
+        if s:
+            pkt = _pack_one(s, tick_fn=tick_fn)
+            packets.append(struct.pack(">H", len(pkt)) + pkt)
+    if not packets:
+        return b""
+    return struct.pack(">H", len(packets)) + b"".join(packets)
 
-    header = struct.pack(">H", len(packets))
-    return header + b"".join(packets)
+
+# ---------------------------------------------------------------------------
+# Connection registry
+# ---------------------------------------------------------------------------
+
+_connections: Dict[Any, Set[int]] = {}   # ws → subscribed token set
+
+
+async def _broadcast(msg: str | bytes) -> None:
+    dead = []
+    for ws in list(_connections):
+        try:
+            await ws.send(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connections.pop(ws, None)
+
+
+async def _broadcast_ticks(tick_fn) -> None:
+    dead = []
+    for ws, tokens in list(_connections.items()):
+        if not tokens:
+            continue
+        try:
+            frame = _build_frame(list(tokens), tick_fn=tick_fn)
+            if frame:
+                await ws.send(frame)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _connections.pop(ws, None)
 
 
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
+<<<<<<< HEAD
 sys.path.insert(0, str(_ROOT))
 try:
     import auth as auth_store
@@ -246,243 +353,289 @@ def _authenticate(ws) -> bool:
     if not AUTH_AVAILABLE:
         return True    # dev mode: accept anything
     return auth_store.validate(api_key, token)
+=======
+def _authenticate(ws: Any) -> tuple[bool, str]:
+    try:
+        raw_path = getattr(ws.request, "path", None) or getattr(ws, "path", "/")
+    except AttributeError:
+        raw_path = "/"
+    qs           = parse_qs(urlparse(raw_path).query)
+    api_key      = qs.get("api_key",      [""])[0]
+    access_token = qs.get("access_token", [""])[0]
+    if not api_key or not access_token:
+        return False, ""
+    return auth_store.validate(api_key, access_token), api_key
+>>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f
 
 
 # ---------------------------------------------------------------------------
-# WebSocket handler
+# Instrument manifest JSON (built once at startup)
 # ---------------------------------------------------------------------------
 
-_INSTRUMENTS_MSG = json.dumps({
+_MANIFEST = json.dumps({
     "type": "instruments",
-    "data": [
-        {
-            "instrument_token": i["token"],
-            "tradingsymbol":    i["symbol"],
-            "exchange":         i["exchange"],
-        }
-        for i in INSTRUMENTS
-    ],
+    "data": [{"instrument_token": i["token"],
+              "tradingsymbol":    i["symbol"],
+              "exchange":         i["exchange"]}
+             for i in INSTRUMENTS],
 })
 
 
+<<<<<<< HEAD
 async def handler(ws: websockets.WebSocketServerProtocol) -> None:
     # 1. Auth
     if not _authenticate(ws):
         logger.warning("Auth failed from %s", ws.remote_address)
         await ws.close(4001, "Invalid api_key or access_token")
+=======
+# ---------------------------------------------------------------------------
+# WebSocket connection handler
+# ---------------------------------------------------------------------------
+
+async def _handle(ws: Any, force_open: bool = False) -> None:
+    ok, api_key = _authenticate(ws)
+    if not ok:
+        logger.warning("Rejected %s — bad credentials", ws.remote_address)
+        await ws.close(code=4001, reason="Invalid api_key or access_token")
+>>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f
         return
 
-    logger.info("Client connected: %s", ws.remote_address)
-    connected_clients.add(ws)
+    all_tokens = list(_state.keys())
+    _connections[ws] = set(all_tokens)
+    logger.info("Client connected: %s  (total=%d)", ws.remote_address, len(_connections))
 
+    # 1. Always send instrument manifest
+    await ws.send(_MANIFEST)
+
+    current = _phase(force_open)
+    now_ist = _now_ist()
+
+    # 2. Phase-aware greeting + initial data
+    if current == "open":
+        await ws.send(json.dumps({"type": "market_open"}))
+
+    elif current == "post_market":
+        await ws.send(json.dumps({
+            "type":      "market_closed",
+            "phase":     "post_market",
+            "message":   "Post-market session (15:30–16:00 IST). Sparse price updates continuing.",
+            "next_open": _next_open_iso(),
+        }))
+        # Send snapshot so client isn't blank on connect
+        snapshot = _build_frame(all_tokens)
+        if snapshot:
+            await ws.send(snapshot)
+
+    else:
+        # CLOSED — weekend, holiday, or after 16:00
+        reason = "weekend" if now_ist.weekday() >= 5 else \
+                 "holiday" if _is_holiday_or_weekend(now_ist.date()) else \
+                 "after hours"
+        await ws.send(json.dumps({
+            "type":      "market_closed",
+            "phase":     "heartbeat",
+            "reason":    reason,
+            "message":   f"Market closed ({reason}). Heartbeat-only until next open.",
+            "next_open": _next_open_iso(),
+        }))
+        # ONE cached snapshot with last known prices (day's O/H/L/C/V)
+        snapshot = _build_frame(all_tokens)
+        if snapshot:
+            logger.debug("Sent cached snapshot to new client (closed — %s).", reason)
+            await ws.send(snapshot)
+        # Immediate heartbeat — don't make client wait 10s
+        await ws.send(HEARTBEAT_BYTE)
+
+    # 3. Stay alive — handle subscription messages from client
     try:
-        # 2. Always send instrument manifest first
-        await ws.send(_INSTRUMENTS_MSG)
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                continue
+            try:
+                msg = json.loads(raw)
+                a   = msg.get("a", "")
+                v   = msg.get("v", [])
+                if a == "subscribe":
+                    _connections[ws].update(int(t) for t in v if int(t) in _state)
+                elif a == "unsubscribe":
+                    _connections[ws].difference_update(int(t) for t in v)
+                elif a == "mode":
+                    extra = [int(t) for t in (v[1] if len(v) > 1 else []) if int(t) in _state]
+                    _connections[ws].update(extra)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
-        if market_open_flag:
-            # 3a. Market is OPEN — announce and let broadcast loop handle ticks
-            await ws.send(json.dumps({"type": "market_open"}))
-            # Just keep connection alive; tick broadcast loop sends to all clients
-            await _wait_until_closed(ws)
-
-        else:
-            # 3b. Market is CLOSED — send one cached price packet, then heartbeats
-            await ws.send(json.dumps({
-                "type":        "market_closed",
-                "next_open":   _next_open_str(),
-            }))
-            # Send cached last-price frame so client has something to display
-            cached_frame = _build_frame()
-            await ws.send(cached_frame)
-            logger.debug("Sent cached price frame to new client (market closed).")
-
-            # Then send 0x21 heartbeats every 10 s until market opens or client leaves
-            await _heartbeat_loop(ws)
-
-    except websockets.ConnectionClosed:
-        pass
+    except websockets.exceptions.ConnectionClosed as exc:
+        logger.info("Disconnected: %s  code=%s", ws.remote_address, exc.code)
     finally:
-        connected_clients.discard(ws)
-        logger.info("Client disconnected: %s", ws.remote_address)
-
-
-async def _wait_until_closed(ws: websockets.WebSocketServerProtocol) -> None:
-    """Keep the connection alive; the broadcast loop pushes frames externally."""
-    try:
-        async for _ in ws:
-            pass   # consume any subscription messages silently
-    except websockets.ConnectionClosed:
-        pass
-
-
-async def _heartbeat_loop(ws: websockets.WebSocketServerProtocol) -> None:
-    """Send 0x21 every 10 s. Exit when market opens or client disconnects."""
-    try:
-        while True:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            if market_open_flag:
-                # Market just opened — announce and hand off to broadcast loop
-                await ws.send(json.dumps({"type": "market_open"}))
-                await _wait_until_closed(ws)
-                return
-            await ws.send(HEARTBEAT_BYTE)
-    except websockets.ConnectionClosed:
-        pass
+        _connections.pop(ws, None)
+        logger.info("Client removed (total=%d)", len(_connections))
 
 
 # ---------------------------------------------------------------------------
-# Broadcast loop — runs as a background task
+# Main broadcast loop
 # ---------------------------------------------------------------------------
 
-async def broadcast_loop() -> None:
-    """
-    Every TICK_INTERVAL seconds during market hours, advance prices and
-    push binary frames to all connected clients.
-    """
-    global market_open_flag
+async def _main_loop(force_open: bool) -> None:
+    prev_phase       = _phase(force_open)
+    last_hb          = time.monotonic()
+    last_live_tick   = time.monotonic()
+    last_post_tick   = time.monotonic()
+    next_post_gap    = random.uniform(POST_MARKET_MIN, POST_MARKET_MAX)
+    last_stats       = time.monotonic()
 
-    prev_open = False
+    logger.info(
+        "Broadcast loop started — phase: %s%s",
+        prev_phase.upper(),
+        "  [force-open mode]" if force_open else "",
+    )
 
     while True:
-        await asyncio.sleep(TICK_INTERVAL)
+        await asyncio.sleep(0.25)   # fine poll — transitions detected within 250ms
+        now     = time.monotonic()
+        current = _phase(force_open)
 
-        now_open = _is_market_open()
+        # ── Phase transition ───────────────────────────────────────────────
 
-        # Transition: closed → open
-        if now_open and not prev_open:
-            market_open_flag = True
-            prev_open        = True
-            _reset_daily()
-            logger.info("Market OPEN — broadcasting ticks.")
-            msg = json.dumps({"type": "market_open"})
-            await _broadcast_text(msg)
+        if current != prev_phase:
+            logger.info(
+                "PHASE TRANSITION  %s → %s  (%s IST)",
+                prev_phase.upper(), current.upper(),
+                _now_ist().strftime("%H:%M:%S"),
+            )
 
-        # Transition: open → closed
-        elif not now_open and prev_open:
-            market_open_flag = False
-            prev_open        = False
-            logger.info("Market CLOSED — switching to heartbeats.")
-            msg = json.dumps({
-                "type":      "market_closed",
-                "next_open": _next_open_str(),
-            })
-            await _broadcast_text(msg)
+            if current == "open":
+                _reset_daily_ohlc()
+                await _broadcast(json.dumps({"type": "market_open"}))
 
-        # During market hours: tick and broadcast
-        if market_open_flag:
-            _tick_prices()
-            frame = _build_frame()
-            await _broadcast_binary(frame)
+            elif current == "post_market":
+                _set_official_close()
+                await _broadcast(json.dumps({
+                    "type":      "market_closed",
+                    "phase":     "post_market",
+                    "message":   "Post-market session started (15:30 IST). Sparse ticks for 30 min.",
+                    "next_open": _next_open_iso(),
+                }))
+                last_post_tick = now
+                next_post_gap  = random.uniform(POST_MARKET_MIN, POST_MARKET_MAX)
 
+            elif current == "closed":
+                now_ist = _now_ist()
+                reason  = "weekend" if now_ist.weekday() >= 5 else \
+                          "holiday" if _is_holiday_or_weekend(now_ist.date()) else \
+                          "after hours"
+                await _broadcast(json.dumps({
+                    "type":      "market_closed",
+                    "phase":     "heartbeat",
+                    "reason":    reason,
+                    "message":   f"Market closed ({reason}). Heartbeat-only until next open.",
+                    "next_open": _next_open_iso(),
+                }))
 
-async def _broadcast_text(msg: str) -> None:
-    dead = set()
-    for ws in list(connected_clients):
-        try:
-            await ws.send(msg)
-        except websockets.ConnectionClosed:
-            dead.add(ws)
-    connected_clients.difference_update(dead)
+            prev_phase = current
 
+        # ── Phase 1: Live binary ticks every 1 second ─────────────────────
 
-async def _broadcast_binary(data: bytes) -> None:
-    dead = set()
-    for ws in list(connected_clients):
-        try:
-            await ws.send(data)
-        except websockets.ConnectionClosed:
-            dead.add(ws)
-    connected_clients.difference_update(dead)
+        if current == "open":
+            if (now - last_live_tick) >= LIVE_TICK_INTERVAL:
+                await _broadcast_ticks(tick_fn=_tick_live)
+                last_live_tick = now
 
+        # ── Phase 2: Post-market sparse binary ticks every 15–30 seconds ──
 
-# ---------------------------------------------------------------------------
-# Market controller (checks every minute for open/close transitions)
-# ---------------------------------------------------------------------------
+        elif current == "post_market":
+            if (now - last_post_tick) >= next_post_gap:
+                await _broadcast_ticks(tick_fn=_tick_post_market)
+                last_post_tick = now
+                next_post_gap  = random.uniform(POST_MARKET_MIN, POST_MARKET_MAX)
+                logger.debug("Post-market tick sent. Next in %.1fs.", next_post_gap)
 
-async def market_controller() -> None:
-    """Sync market_open_flag with real IST time every 60 s."""
-    global market_open_flag
-    while True:
-        market_open_flag = _is_market_open()
-        await asyncio.sleep(60)
+        # ── Phase 3 (and Phase 2): Heartbeat 0x21 every 10 seconds ────────
+        # NOTE: Phase 1 does NOT send heartbeats — tick frames keep connection alive
 
+        if current in ("post_market", "closed"):
+            if (now - last_hb) >= HEARTBEAT_INTERVAL:
+                await _broadcast(HEARTBEAT_BYTE)
+                last_hb = now
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+        # ── Periodic status log every 60 seconds ──────────────────────────
 
-def _next_open_str() -> str:
-    from datetime import timedelta
-    now = _now_ist()
-    # Find next weekday at 09:15
-    candidate = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    if now >= candidate:
-        candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate.strftime("%Y-%m-%d 09:15 IST")
+        if (now - last_stats) >= 60.0:
+            logger.info(
+                "Status — phase: %-12s  clients: %d  next_open: %s",
+                current.upper(), len(_connections), _next_open_iso(),
+            )
+            last_stats = now
 
 
 # ---------------------------------------------------------------------------
-# Stats logger
+# CLI + entry point
 # ---------------------------------------------------------------------------
-
-async def stats_logger() -> None:
-    while True:
-        await asyncio.sleep(30)
-        logger.info(
-            "Clients connected: %d  |  Market: %s",
-            len(connected_clients),
-            "OPEN" if market_open_flag else "CLOSED",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main(host: str, port: int) -> None:
-    global force_open, market_open_flag
-
-    _init_prices()
-    market_open_flag = _is_market_open()
-
-    if AUTH_AVAILABLE:
-        auth_store.ensure_default_key()
-
-    logger.info("Kite Simulator starting on ws://%s:%d", host, port)
-    logger.info("Market: %s  |  Force-open: %s", "OPEN" if market_open_flag else "CLOSED", force_open)
-
-    async with websockets.serve(handler, host, port, max_size=2**20):
-        await asyncio.gather(
-            broadcast_loop(),
-            market_controller(),
-            stats_logger(),
-        )
-
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Kite WebSocket Simulator")
-    parser.add_argument("--host",       default=os.getenv("SIM_HOST", "0.0.0.0"))
-    parser.add_argument("--port",       default=int(os.getenv("SIM_PORT", "8765")), type=int)
-    parser.add_argument("--force-open", action="store_true",
-                        help="Treat market as always open (24/7 tick streaming)")
-    parser.add_argument("--log-level",  default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Zerodha KiteTicker Simulator (3-phase: open / post-market / closed)"
+    )
+    p.add_argument("--host",       default="0.0.0.0")
+    p.add_argument("--port",       default=8765, type=int)
+    p.add_argument("--force-open", action="store_true",
+                   help="Always stream live ticks regardless of IST time / holidays")
+    p.add_argument("--log-level",  default="INFO",
+                   choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p.parse_args()
 
 
-if __name__ == "__main__":
+async def _main(host: str, port: int, force_open: bool) -> None:
+    _init_state()
+
+    default = auth_store.ensure_default_key()
+    if default:
+        print("\n" + "=" * 60)
+        print("  FIRST-RUN DEFAULT CREDENTIALS  (save these now!)")
+        print(f"  api_key      = {default['api_key']}")
+        print(f"  access_token = {default['access_tokens'][0]}")
+        print("=" * 60 + "\n")
+
+    current = _phase(force_open)
+    now_ist = _now_ist()
+
+    logger.info(
+        "Kite Simulator (3-phase) ws://%s:%d  phase=%s  force_open=%s",
+        host, port, current.upper(), force_open,
+    )
+
+    if current == "closed" and not force_open:
+        reason = "weekend" if now_ist.weekday() >= 5 else \
+                 "holiday" if _is_holiday_or_weekend(now_ist.date()) else \
+                 "after hours"
+        logger.info("Market is CLOSED (%s). Next open: %s", reason, _next_open_iso())
+        logger.info("Sending heartbeat 0x21 every %.0fs. Use --force-open to stream ticks.", HEARTBEAT_INTERVAL)
+
+    async def handler(ws: Any) -> None:
+        await _handle(ws, force_open=force_open)
+
+    async with websockets.serve(handler, host, port, ping_interval=None, max_size=None):
+        await _main_loop(force_open)
+
+
+def main() -> None:
     args = _parse_args()
-    force_open = args.force_open
-
     logging.basicConfig(
         level   = getattr(logging, args.log_level),
         format  = "%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         datefmt = "%Y-%m-%d %H:%M:%S",
     )
-
     try:
-        asyncio.run(main(args.host, args.port))
+        asyncio.run(_main(args.host, args.port, args.force_open))
     except KeyboardInterrupt:
+<<<<<<< HEAD
         logger.info("Simulator stopped.")
+=======
+        pass
+    finally:
+        logger.info("Simulator stopped.")
+
+
+if __name__ == "__main__":
+    main()
+>>>>>>> 0d64f57cb6c57e5bf13893fe0cfb6b92db5dc02f

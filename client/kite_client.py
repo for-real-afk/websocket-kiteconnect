@@ -282,7 +282,7 @@ class KiteSimClient:
             )
             with self._lock:
                 self._ws = ws
-            ws.run_forever(ping_interval=20, ping_timeout=30)
+            ws.run_forever(ping_interval=30, ping_timeout=20)
             if self._running.is_set():
                 logger.info("Reconnecting in 5s…")
                 time.sleep(5)
